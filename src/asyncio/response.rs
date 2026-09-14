@@ -18,6 +18,7 @@ use crate::{
     shared::{
         buffer::BytesMemoryView,
         constants::Constants,
+        exception::without_pending_exception,
         response::{ResponseBody, ResponseHead, RustFullResponse},
     },
 };
@@ -244,22 +245,27 @@ impl Drop for RequestIterTask {
         let Some(task) = self.task.swap(None) else {
             return;
         };
-        // SAFETY - the task is populated in the response future's done callback,
-        // meaning a dropped Response is always during Python garbage collection.
-        // This attach is reentrant and cannot happen on a tokio thread as a result.
+        // SAFETY - the task is only stored on a Response that Python owns (the
+        // response future's done callback and `_set_request_iter_task`), so a
+        // Response with a task is always dropped during Python deallocation. This
+        // attach is reentrant and cannot happen on a tokio worker thread as a
+        // result.
         Python::attach(|py| {
-            let task = task.bind(py);
-            // Deallocation may run on any thread holding the GIL, so schedule
-            // the cancellation on the task's event loop instead of calling it
-            // directly. Ignore errors from an already closed loop.
-            let _ = task
-                .call_method0(&self.constants.get_loop)
-                .and_then(|event_loop| {
-                    event_loop.call_method1(
-                        &self.constants.call_soon_threadsafe,
-                        (task.getattr(&self.constants.cancel)?,),
-                    )
-                });
+            // Needed since this is a Drop implementation.
+            without_pending_exception(py, || {
+                let task = task.bind(py);
+                // Deallocation may run on any thread holding the GIL, so schedule
+                // the cancellation on the task's event loop instead of calling it
+                // directly. Ignore errors from an already closed loop.
+                let _ = task
+                    .call_method0(&self.constants.get_loop)
+                    .and_then(|event_loop| {
+                        event_loop.call_method1(
+                            &self.constants.call_soon_threadsafe,
+                            (task.getattr(&self.constants.cancel)?,),
+                        )
+                    });
+            });
         });
     }
 }
