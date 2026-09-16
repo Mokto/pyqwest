@@ -1,5 +1,13 @@
-use std::sync::{Mutex, PoisonError};
+use std::{
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, PoisonError,
+    },
+    task::{ready, Context, Poll},
+};
 
+use futures_core::Stream;
 use pyo3::{
     exceptions::{PyBaseException, PyRuntimeError},
     pyclass, pymethods,
@@ -25,23 +33,53 @@ pub(super) fn into_stream(
     constants: &Constants,
     library: AsyncLibrary,
 ) -> PyResult<(
-    impl futures_core::Stream<Item = RequestStreamResult<Py<PyAny>>>,
+    impl Stream<Item = RequestStreamResult<Py<PyAny>>>,
     Py<PyAny>,
 )> {
     let (tx, rx) = mpsc::channel::<RequestStreamResult<Py<PyAny>>>(10);
+    let finished = Arc::new(AtomicBool::new(false));
     let sender = Py::new(
         py,
         Sender {
             library,
             constants: constants.clone(),
             tx: Mutex::new(Some(tx)),
+            finished: Arc::clone(&finished),
         },
     )?;
 
     let handle = spawn_pump(py, library, constants, gen, sender.into_any())?;
 
-    let stream = ReceiverStream::new(rx);
+    let stream = FailUnfinished {
+        rx: ReceiverStream::new(rx),
+        finished: Some(finished),
+    };
     Ok((stream, handle))
+}
+
+/// Fails a body whose sender closed without `Sender::finish`, as when its
+/// iterator is interrupted: ending the stream would send the truncated body as
+/// complete.
+struct FailUnfinished {
+    rx: ReceiverStream<RequestStreamResult<Py<PyAny>>>,
+    /// Taken when the channel ends, so the error is yielded once.
+    finished: Option<Arc<AtomicBool>>,
+}
+
+impl Stream for FailUnfinished {
+    type Item = RequestStreamResult<Py<PyAny>>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if let Some(item) = ready!(Pin::new(&mut this.rx).poll_next(cx)) {
+            return Poll::Ready(Some(item));
+        }
+        let truncated = this
+            .finished
+            .take()
+            .is_some_and(|finished| !finished.load(Ordering::Acquire));
+        Poll::Ready(truncated.then(|| Err(RequestStreamError::unfinished())))
+    }
 }
 
 #[pyclass(module = "_pyqwest.async", frozen)]
@@ -49,6 +87,7 @@ struct Sender {
     library: AsyncLibrary,
     constants: Constants,
     tx: Mutex<Option<mpsc::Sender<RequestStreamResult<Py<PyAny>>>>>,
+    finished: Arc<AtomicBool>,
 }
 
 #[pymethods]
@@ -91,6 +130,13 @@ impl Sender {
             None,
         )
         .map(Bound::unbind)
+    }
+
+    /// Closes the channel with the body complete.
+    fn finish(&self, py: Python<'_>) {
+        // Set before closing, so the receiver sees it when the channel ends.
+        self.finished.store(true, Ordering::Release);
+        self.close(py);
     }
 
     fn close(&self, py: Python<'_>) {
