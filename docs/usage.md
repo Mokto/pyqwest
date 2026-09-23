@@ -416,3 +416,23 @@ The log records are emitted directly from the Rust HTTP transports with no overh
 when neither logger is enabled for `DEBUG`. Requests that fail without a response,
 such as connection errors, appear only on the `pyqwest` logger, keeping the access
 log to requests with responses like httpx.
+
+## Worker threads
+
+Requests are driven by a process-wide [tokio](https://tokio.rs) runtime, built on
+first use with one worker thread per available core. Set `PYQWEST_WORKER_THREADS`
+to cap that count:
+
+```bash
+PYQWEST_WORKER_THREADS=4 python app.py
+```
+
+This mainly matters under a container CPU limit. Those are enforced by CFS quota
+rather than by narrowing the CPU affinity mask the runtime reads, so a process
+granted a fraction of a large host still starts a worker per host core — for
+example 20 workers against a 2.5 core limit. The cost is resident memory as much
+as idle threads, since each worker that allocates keeps a glibc malloc arena
+alive for the life of the process.
+
+The variable is read once, when the runtime is built. An unset, zero or
+unparseable value keeps tokio's default.
