@@ -420,19 +420,22 @@ log to requests with responses like httpx.
 ## Worker threads
 
 Requests are driven by a process-wide [tokio](https://tokio.rs) runtime, built on
-first use with one worker thread per available core. Set `PYQWEST_WORKER_THREADS`
-to cap that count:
+first use with one worker thread per available core. You may want to cap the
+number of request worker threads, for example when running in a container
+sharing a node without setting CPU limits — CPU requests don't enforce elastic
+limits, so a process granted a fraction of a large host still starts a worker
+per host core (e.g. 20 workers against a 2.5-core request). The cost is
+resident memory as much as idle threads, since each worker that allocates
+keeps a glibc malloc arena alive for the life of the process.
+
+tokio already reads [`TOKIO_WORKER_THREADS`](https://docs.rs/tokio/latest/tokio/runtime/struct.Builder.html#method.worker_threads)
+as the default worker count when pyqwest doesn't call `worker_threads()` on the
+builder itself, so setting it works today without any pyqwest-specific option:
 
 ```bash
-PYQWEST_WORKER_THREADS=4 python app.py
+TOKIO_WORKER_THREADS=4 python app.py
 ```
 
-This mainly matters under a container CPU limit. Those are enforced by CFS quota
-rather than by narrowing the CPU affinity mask the runtime reads, so a process
-granted a fraction of a large host still starts a worker per host core — for
-example 20 workers against a 2.5 core limit. The cost is resident memory as much
-as idle threads, since each worker that allocates keeps a glibc malloc arena
-alive for the life of the process.
-
-The variable is read once, when the runtime is built. An unset, zero or
-unparseable value keeps tokio's default.
+Unlike a pyqwest-specific variable, this one is tokio's own and follows its
+rules: it's read once, when the runtime is built, and an unset value keeps the
+default, but a zero or unparseable value panics rather than falling back.
