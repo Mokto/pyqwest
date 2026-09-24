@@ -422,20 +422,13 @@ log to requests with responses like httpx.
 Requests are driven by a process-wide [tokio](https://tokio.rs) runtime, built on
 first use with one worker thread per available core. You may want to cap the
 number of request worker threads, for example when running in a container
-sharing a node without setting CPU limits — CPU requests don't enforce elastic
-limits, so a process granted a fraction of a large host still starts a worker
-per host core (e.g. 20 workers against a 2.5-core request). The cost is
-resident memory as much as idle threads, since each worker that allocates
-keeps a glibc malloc arena alive for the life of the process.
+sharing a node without setting CPU limits. Notably, container CPU _requests_ 
+don't enforce elastic limits and a worker will be spawned for each CPU on the
+shared node. This may cause excessive memory usage.
 
-tokio already reads [`TOKIO_WORKER_THREADS`](https://docs.rs/tokio/latest/tokio/runtime/struct.Builder.html#method.worker_threads)
-as the default worker count when pyqwest doesn't call `worker_threads()` on the
-builder itself, so setting it works today without any pyqwest-specific option:
+Set the `TOKIO_WORKER_THREADS` environment variable to use a custom value of
+workers. The value must be numeric.
 
 ```bash
 TOKIO_WORKER_THREADS=4 python app.py
 ```
-
-Unlike a pyqwest-specific variable, this one is tokio's own and follows its
-rules: it's read once, when the runtime is built, and an unset value keeps the
-default, but a zero or unparseable value panics rather than falling back.
